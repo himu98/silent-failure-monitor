@@ -104,7 +104,7 @@ that would drag an average upward.
 ### Try it in 30 seconds
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/silent-failure-monitor.git
+git clone https://github.com/himu98/silent-failure-monitor.git
 cd silent-failure-monitor/engine
 
 # a stream that has quietly stopped
