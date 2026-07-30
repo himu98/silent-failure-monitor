@@ -1,0 +1,264 @@
+{
+  "name": "Silent Failure Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 4
+            }
+          ]
+        }
+      },
+      "id": "b2000000-0000-0000-0000-000000000001",
+      "name": "Every 4 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "notesInFlow": true,
+      "notes": "Checks four times a day. Match this to CHECK_WINDOW_HOURS in the detection node."
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "options": {}
+      },
+      "id": "b2000000-0000-0000-0000-000000000002",
+      "name": "Read Event Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        240,
+        0
+      ],
+      "notesInFlow": true,
+      "notes": "AFTER IMPORT: connect Google Sheets, pick the sheet where events land (form responses, orders, bookings). Needs a timestamp column."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------\n// Silent Failure Detection\n// Watches for the ABSENCE of expected events, not for errors.\n// ---------------------------------------------------------------\n\nconst CONFIG = {\n  timestampField: 'timestamp',   // column name holding the event time\n  eventName: 'contact form submission',\n  checkWindowHours: 4,\n  minHistoryDays: 14,\n  sensitivity: 0.25,             // alert if actual < 25% of expected\n  minExpectedToAlert: 1.5,       // ignore normally-quiet windows\n  consecutiveWindows: 2,         // confirm before alerting (kills false alarms)\n  businessHours: { start: 9, end: 18 },\n  businessDays: [1, 2, 3, 4, 5], // JS: Sun=0 ... Sat=6\n};\n\nconst now = new Date();\n\n// --- parse events -------------------------------------------------\n// Google Sheets strips leading zeros from hours (\"9:39\" not \"09:39\"), which\n// makes naive ISO parsing return Invalid Date and silently drop those rows.\n// This parser handles the formats real spreadsheets actually produce.\nfunction parseTs(raw) {\n  if (raw === null || raw === undefined || raw === '') return null;\n  const s = String(raw).trim();\n  let m = s.match(/^(\\d{4})-(\\d{1,2})-(\\d{1,2})[T ](\\d{1,2}):(\\d{2})(?::(\\d{2}))?/);\n  if (m) return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));\n  m = s.match(/^(\\d{4})-(\\d{1,2})-(\\d{1,2})$/);\n  if (m) return new Date(+m[1], +m[2] - 1, +m[3]);\n  m = s.match(/^(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})(?:[T ](\\d{1,2}):(\\d{2})(?::(\\d{2}))?)?/);\n  if (m) return new Date(+m[3], +m[1] - 1, +m[2], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));\n  const d = new Date(s);\n  return isNaN(d.getTime()) ? null : d;\n}\n\nconst events = [];\nlet skipped = 0;\nfor (const item of $input.all()) {\n  const d = parseTs(item.json[CONFIG.timestampField]);\n  if (d) { events.push(d); } else { skipped++; }\n}\nevents.sort((a, b) => a - b);\n\nif (skipped > 0) {\n  console.log(`Warning: ${skipped} row(s) had unreadable timestamps and were skipped.`);\n}\n\nif (events.length === 0) {\n  return [{ json: { status: 'no_data', alert: false, message: 'No events found in source.' } }];\n}\n\nconst historyDays = (now - events[0]) / 86400000;\nif (historyDays < CONFIG.minHistoryDays) {\n  return [{ json: { status: 'learning', alert: false,\n    message: `Only ${historyDays.toFixed(1)} days of history; need ${CONFIG.minHistoryDays}.` } }];\n}\n\n// --- baseline: median events per (weekday, window), zeros included ---\nconst W = CONFIG.checkWindowHours;\nconst windowsPerDay = 24 / W;\nconst historyEnd = new Date(now.getTime() - 86400000); // exclude today\n\nconst counts = {};                       // \"YYYY-MM-DD|key\" -> count\nfor (const e of events) {\n  if (e >= historyEnd) continue;\n  const key = `${e.getDay()}-${Math.floor(e.getHours() / W)}`;\n  const dk = `${e.toISOString().slice(0, 10)}|${key}`;\n  counts[dk] = (counts[dk] || 0) + 1;\n}\n\nconst perKey = {};\nfor (let d = new Date(events[0]); d < historyEnd; d.setDate(d.getDate() + 1)) {\n  const dayStr = d.toISOString().slice(0, 10);\n  for (let w = 0; w < windowsPerDay; w++) {\n    const key = `${d.getDay()}-${w}`;\n    (perKey[key] = perKey[key] || []).push(counts[`${dayStr}|${key}`] || 0);\n  }\n}\n\nconst median = arr => {\n  const s = [...arr].sort((a, b) => a - b);\n  const m = Math.floor(s.length / 2);\n  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;\n};\n\n// --- evaluate recent windows -------------------------------------\nconst inBusinessHours = d =>\n  CONFIG.businessDays.includes(d.getDay()) &&\n  d.getHours() >= CONFIG.businessHours.start &&\n  d.getHours() < CONFIG.businessHours.end;\n\nconst judged = [];\nfor (let i = 0; i < CONFIG.consecutiveWindows * 12; i++) {\n  if (judged.length >= CONFIG.consecutiveWindows) break;\n\n  const wEnd = new Date(now.getTime() - i * W * 3600000);\n  const wStart = new Date(wEnd.getTime() - W * 3600000);\n  if (!inBusinessHours(wStart)) continue;\n\n  const key = `${wStart.getDay()}-${Math.floor(wStart.getHours() / W)}`;\n  const hist = perKey[key];\n  if (!hist || hist.length < 2) continue;\n\n  const expected = median(hist);\n  if (expected < CONFIG.minExpectedToAlert) continue;\n\n  const actual = events.filter(e => e >= wStart && e < wEnd).length;\n  judged.push({ expected, actual, anomalous: (actual / expected) < CONFIG.sensitivity });\n}\n\nif (judged.length < CONFIG.consecutiveWindows) {\n  return [{ json: { status: 'unknown', alert: false, message: 'Not enough comparable windows.' } }];\n}\n\nconst confirmed = judged.every(j => j.anomalous);\nconst last = events[events.length - 1];\nconst silentHours = ((now - last) / 3600000).toFixed(1);\n\nreturn [{ json: {\n  status: confirmed ? 'alert' : 'healthy',\n  alert: confirmed,\n  eventName: CONFIG.eventName,\n  silentHours,\n  lastEvent: last.toISOString().replace('T', ' ').slice(0, 16),\n  totalExpected: judged.reduce((s, j) => s + j.expected, 0).toFixed(1),\n  totalActual: judged.reduce((s, j) => s + j.actual, 0),\n  windowsChecked: judged.length,\n} }];"
+      },
+      "id": "b2000000-0000-0000-0000-000000000003",
+      "name": "Detect Silent Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ],
+      "notesInFlow": true,
+      "notes": "The core logic. Edit CONFIG at the top to match the client's business hours and event type."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "alert-check",
+              "leftValue": "={{ $json.alert }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2000000-0000-0000-0000-000000000004",
+      "name": "Anomaly Confirmed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "content-type",
+              "value": "application/json"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "x-api-key",
+              "value": "YOUR_ANTHROPIC_API_KEY"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 400, messages: [ { role: 'user', content: `You are writing to a non-technical small business owner.\\n\\nTheir \"${$json.eventName}\" stream has stopped. Facts:\\n- Last one received: ${$json.lastEvent} (${$json.silentHours} hours ago)\\n- Expected in this period: about ${$json.totalExpected}\\n- Actually received: ${$json.totalActual}\\n\\nWrite a short alert (max 120 words) that: 1) states plainly what stopped and for how long, 2) lists the 3 most likely causes in plain English, most likely first, 3) gives one specific first thing to check. Be calm and factual. Do not invent details. Plain text only, no markdown.` } ] }) }}",
+        "options": {}
+      },
+      "id": "b2000000-0000-0000-0000-000000000005",
+      "name": "AI Diagnosis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        -100
+      ],
+      "onError": "continueRegularOutput",
+      "notesInFlow": true,
+      "notes": "Replace YOUR_ANTHROPIC_API_KEY. onError=continue so an API hiccup still lets the alert go out."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the final alert. Falls back to a plain summary if the AI call failed.\nconst detection = $('Detect Silent Failure').first().json;\nlet diagnosis = '';\n\ntry {\n  diagnosis = $json.content[0].text.trim();\n} catch (e) {\n  diagnosis = `No ${detection.eventName}s received for ${detection.silentHours} hours. `\n    + `About ${detection.totalExpected} were expected; ${detection.totalActual} arrived.\\n\\n`\n    + `Likely causes: a recent website or plugin update broke it; notification emails are `\n    + `being blocked or sent to an old address; or the provider had an outage.\\n\\n`\n    + `First check: submit one yourself and confirm it arrives.`;\n}\n\nconst subject = `Alert: ${detection.eventName}s have stopped (${detection.silentHours}h)`;\nconst body = `${diagnosis}\\n\\n---\\nLast received: ${detection.lastEvent}\\n`\n  + `Expected in this period: ~${detection.totalExpected}\\nActually received: ${detection.totalActual}\\n`\n  + `\\nThis is an automated check from Silent Failure Monitor.`;\n\nreturn [{ json: { subject, body, ...detection } }];"
+      },
+      "id": "b2000000-0000-0000-0000-000000000006",
+      "name": "Format Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "owner@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.body }}",
+        "options": {}
+      },
+      "id": "b2000000-0000-0000-0000-000000000007",
+      "name": "Send Alert Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1440,
+        -100
+      ],
+      "notesInFlow": true,
+      "notes": "AFTER IMPORT: connect Gmail and set the recipient. Swap for Slack/SMS if the client prefers."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Healthy path: log the check so there's a record the monitor ran.\nconsole.log(`[${new Date().toISOString()}] Healthy - ${$json.totalActual} events vs ~${$json.totalExpected} expected.`);\nreturn [{ json: { logged: true, ...$json } }];"
+      },
+      "id": "b2000000-0000-0000-0000-000000000008",
+      "name": "Log Healthy Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "Every 4 Hours": {
+      "main": [
+        [
+          {
+            "node": "Read Event Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Event Log": {
+      "main": [
+        [
+          {
+            "node": "Detect Silent Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Silent Failure": {
+      "main": [
+        [
+          {
+            "node": "Anomaly Confirmed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anomaly Confirmed?": {
+      "main": [
+        [
+          {
+            "node": "AI Diagnosis",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Healthy Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Diagnosis": {
+      "main": [
+        [
+          {
+            "node": "Format Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Alert Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "silent-failure-monitor"
+  }
+}

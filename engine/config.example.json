@@ -1,0 +1,12 @@
+{
+  "event_name": "contact form submission",
+  "business_name": "Example Plumbing Co",
+  "business_hours": { "start": 9, "end": 18 },
+  "business_days": [0, 1, 2, 3, 4],
+  "check_window_hours": 4,
+  "min_history_days": 14,
+  "sensitivity": 0.25,
+  "min_expected_to_alert": 1.5,
+  "consecutive_windows_required": 2,
+  "alert_cooldown_hours": 12
+}
