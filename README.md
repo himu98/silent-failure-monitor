@@ -203,7 +203,7 @@ problem it exists to solve.
 
 ## Why I built it
 
-I spent a year as an IT monitoring specialist watching production systems. The daily work was
+I spent my time as an IT monitoring specialist watching production systems. The daily work was
 noticing when a pattern broke before anyone filed a ticket, then explaining the finding to people
 who didn't speak the technical language.
 
